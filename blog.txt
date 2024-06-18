@@ -1,0 +1,78 @@
+ref: https://zhuanlan.zhihu.com/p/684120282  GPT-SOVITS 技术原理
+
+推理过程：
+输入：
+    待合成文本   text
+    参考文本    ref_text（phones1）
+    参考音频    ref_wav（phones2）
+
+文本处理：
+    1、text_ids转换为发音phone_ids
+    2、根据phone_ids编码bert特征
+    3、取bert模型倒数第2层tensor，同时去掉SOS和EOS
+
+音频处理：
+    1、实用cn_hubert,基于wav逐层encode，抽取语音hubert自监督向量
+    2、过codebook，得到wav对应的codebook ids
+    3、基于wav，收取频谱spec帧特征
+
+过vall-e推理（Text2SemanticDecoder）
+    1、实用phone_ids、phone_bert特征，参考音频的wav codebook ids
+    2、预测pred_semantic和idx，idx用于截断pred_semantic（去掉参考音频的特征）
+
+过vits模型decode推理（SynthesizerTrn）
+    1、使用vall-e预测的pred_semantic,phones2，参考音频的语音帧refer_spec
+    2、vits decode解码，直接得到对应的wav
+
+vall-e模型推理
+
+
+Text2SemanticLightningModule(
+  (model): Text2SemanticDecoder(
+    (bert_proj): Linear(in_features=1024, out_features=512, bias=True)
+    (ar_text_embedding): TokenEmbedding(
+      (dropout): Dropout(p=0, inplace=False)
+      (word_embeddings): Embedding(512, 512)
+    )
+    (ar_text_position): SinePositionalEmbedding(
+      (dropout): Dropout(p=0.1, inplace=False)
+    )
+    (ar_audio_embedding): TokenEmbedding(
+      (dropout): Dropout(p=0, inplace=False)
+      (word_embeddings): Embedding(1025, 512)
+    )
+    (ar_audio_position): SinePositionalEmbedding(
+      (dropout): Dropout(p=0.1, inplace=False)
+    )
+    (h): TransformerEncoder(
+      (layers): ModuleList(
+        (0-23): 24 x TransformerEncoderLayer(
+          (self_attn): MultiheadAttention(
+            (out_proj): NonDynamicallyQuantizableLinear(in_features=512, out_features=512, bias=True)
+          )
+          (linear1): Linear(in_features=512, out_features=2048, bias=True)
+          (dropout): Dropout(p=0.1, inplace=False)
+          (linear2): Linear(in_features=2048, out_features=512, bias=True)
+          (dropout1): Dropout(p=0.1, inplace=False)
+          (dropout2): Dropout(p=0.1, inplace=False)
+          (norm1): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+          (norm2): LayerNorm((512,), eps=1e-05, elementwise_affine=True)
+        )
+      )
+    )
+    (ar_predict_layer): Linear(in_features=512, out_features=1025, bias=False)
+    (loss_fct): CrossEntropyLoss()
+    (ar_accuracy_metric): MulticlassAccuracy()
+  )
+)
+
+
+vits模型推理解码
+
+    1、使用vall-e预测的pred_semantic,phones2，参考音频的语音帧refer_spec
+    2、vits decode解码，直接得到对应的wav
+
+涉及到的模块
+    1、code量化解码模块，使用ResidualVectorQuantizer，将vall-e预测的pred_semantic code_ids进行量化解码，
+        例如输入shape[1,129] -> 输出shape [1,768,129]
+    2、ref_enc-语音mel帧编码模块，使用MelStyleEncoder
