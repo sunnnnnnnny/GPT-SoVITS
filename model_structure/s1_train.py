@@ -1,135 +1,171 @@
-#
-import torch
+# modified from https://github.com/feng-yufei/shared_debugging_code/blob/main/train_t2s.py
+import os
+import pdb
 
-def forward(self, x, x_lens, y, y_lens, bert_feature):
-    """
-    x: phoneme_ids
-    y: semantic_ids
-    """
-    x = self.ar_text_embedding(x)
-    x = x + self.bert_proj(bert_feature.transpose(1, 2))
-    x = self.ar_text_position(x)
-    x_mask = make_pad_mask(x_lens)
+if "_CUDA_VISIBLE_DEVICES" in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["_CUDA_VISIBLE_DEVICES"]
+import argparse
+import logging
+from pathlib import Path
 
-    y_mask = make_pad_mask(y_lens)
-    y_mask_int = y_mask.type(torch.int64)
-    codes = y.type(torch.int64) * (1 - y_mask_int)
+import torch, platform
+from pytorch_lightning import seed_everything
+from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger  # WandbLogger
+from pytorch_lightning.strategies import DDPStrategy
+from AR.data.data_module import Text2SemanticDataModule
+from AR.models.t2s_lightning_module import Text2SemanticLightningModule
+from AR.utils.io import load_yaml_config
 
-    # Training
-    # AR Decoder
-    y, targets = self.pad_y_eos(codes, y_mask_int, eos_id=self.EOS)
-    x_len = x_lens.max()
-    y_len = y_lens.max()
-    y_emb = self.ar_audio_embedding(y)
-    y_pos = self.ar_audio_position(y_emb)
+logging.getLogger("numba").setLevel(logging.WARNING)
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
+torch.set_float32_matmul_precision("high")
+from AR.utils import get_newest_ckpt
 
-    xy_padding_mask = torch.concat([x_mask, y_mask], dim=1)
-    ar_xy_padding_mask = xy_padding_mask
-
-    x_attn_mask = F.pad(
-        torch.zeros((x_len, x_len), dtype=torch.bool, device=x.device),
-        (0, y_len),
-        value=True,
-    )
-    y_attn_mask = F.pad(
-        torch.triu(
-            torch.ones(y_len, y_len, dtype=torch.bool, device=x.device),
-            diagonal=1,
-        ),
-        (x_len, 0),
-        value=False,
-    )
-    xy_attn_mask = torch.concat([x_attn_mask, y_attn_mask], dim=0)
-    bsz, src_len = x.shape[0], x_len + y_len
-    _xy_padding_mask = (
-        ar_xy_padding_mask.view(bsz, 1, 1, src_len)
-        .expand(-1, self.num_head, -1, -1)
-        .reshape(bsz * self.num_head, 1, src_len)
-    )
-    xy_attn_mask = xy_attn_mask.logical_or(_xy_padding_mask)
-    new_attn_mask = torch.zeros_like(xy_attn_mask, dtype=x.dtype)
-    new_attn_mask.masked_fill_(xy_attn_mask, float("-inf"))
-    xy_attn_mask = new_attn_mask
-    # x 和完整的 y 一次性输入模型
-    xy_pos = torch.concat([x, y_pos], dim=1)
-    xy_dec, _ = self.h(
-        (xy_pos, None),
-        mask=xy_attn_mask,
-    )
-    logits = self.ar_predict_layer(xy_dec[:, x_len:]).permute(0, 2, 1)
-    # loss
-    # from feiteng: 每次 duration 越多, 梯度更新也应该更多, 所以用 sum
-    loss = F.cross_entropy(logits, targets, reduction="sum")
-    acc = self.ar_accuracy_metric(logits.detach(), targets).item()
-    return loss, acc
+from collections import OrderedDict
+from time import time as ttime
+import shutil
+def my_save(fea,path):#####fix issue: torch.save doesn't support chinese path
+    dir=os.path.dirname(path)
+    name=os.path.basename(path)
+    tmp_path="%s.pth"%(ttime())
+    torch.save(fea,tmp_path)
+    shutil.move(tmp_path,"%s/%s"%(dir,name))
 
 
-# 需要看下这个函数和 forward 的区别以及没有 semantic 的时候 prompts 输入什么
-def infer(
+class my_model_ckpt(ModelCheckpoint):
+    def __init__(
         self,
-        x,
-        x_lens,
-        prompts,
-        bert_feature,
-        top_k: int = -100,
-        early_stop_num: int = -1,
-        temperature: float = 1.0,
-):
-    x = self.ar_text_embedding(x)
-    x = x + self.bert_proj(bert_feature.transpose(1, 2))
-    x = self.ar_text_position(x)
+        config,
+        if_save_latest,
+        if_save_every_weights,
+        half_weights_save_dir,
+        exp_name,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.if_save_latest = if_save_latest
+        self.if_save_every_weights = if_save_every_weights
+        self.half_weights_save_dir = half_weights_save_dir
+        self.exp_name = exp_name
+        self.config = config
 
-    # AR Decoder
-    y = prompts
-    prefix_len = y.shape[1]
-    x_len = x.shape[1]
-    x_attn_mask = torch.zeros((x_len, x_len), dtype=torch.bool)
-    stop = False
-    for _ in tqdm(range(1500)):
-        y_emb = self.ar_audio_embedding(y)
-        y_pos = self.ar_audio_position(y_emb)
-        # x 和逐渐增长的 y 一起输入给模型
-        xy_pos = torch.concat([x, y_pos], dim=1)
-        y_len = y.shape[1]
-        x_attn_mask_pad = F.pad(
-            x_attn_mask,
-            (0, y_len),
-            value=True,
-        )
-        y_attn_mask = F.pad(
-            torch.triu(torch.ones(y_len, y_len, dtype=torch.bool), diagonal=1),
-            (x_len, 0),
-            value=False,
-        )
-        xy_attn_mask = torch.concat([x_attn_mask_pad, y_attn_mask], dim=0).to(
-            y.device
-        )
+    def on_train_epoch_end(self, trainer, pl_module):
+        # if not self._should_skip_saving_checkpoint(trainer) and self._should_save_on_train_epoch_end(trainer):
+        if self._should_save_on_train_epoch_end(trainer):
+            monitor_candidates = self._monitor_candidates(trainer)
+            if (
+                self._every_n_epochs >= 1
+                and (trainer.current_epoch + 1) % self._every_n_epochs == 0
+            ):
+                if (
+                    self.if_save_latest == True
+                ):  ####如果设置只保存最后一个ckpt，在保存下一个ckpt后要清理掉之前的所有ckpt
+                    to_clean = list(os.listdir(self.dirpath))
+                self._save_topk_checkpoint(trainer, monitor_candidates)
+                if self.if_save_latest == True:
+                    for name in to_clean:
+                        try:
+                            os.remove("%s/%s" % (self.dirpath, name))
+                        except:
+                            pass
+                if self.if_save_every_weights == True:
+                    to_save_od = OrderedDict()
+                    to_save_od["weight"] = OrderedDict()
+                    dictt = trainer.strategy._lightning_module.state_dict()
+                    for key in dictt:
+                        to_save_od["weight"][key] = dictt[key].half()
+                    to_save_od["config"] = self.config
+                    to_save_od["info"] = "GPT-e%s" % (trainer.current_epoch + 1)
+                    # torch.save(
+                    my_save(
+                        to_save_od,
+                        "%s/%s-e%s.ckpt"
+                        % (
+                            self.half_weights_save_dir,
+                            self.exp_name,
+                            trainer.current_epoch + 1,
+                        ),
+                    )
+            self._save_last_checkpoint(trainer, monitor_candidates)
 
-        xy_dec, _ = self.h(
-            (xy_pos, None),
-            mask=xy_attn_mask,
-        )
-        logits = self.ar_predict_layer(xy_dec[:, -1])
-        samples = topk_sampling(
-            logits, top_k=top_k, top_p=1.0, temperature=temperature
-        )
 
-        if early_stop_num != -1 and (y.shape[1] - prefix_len) > early_stop_num:
-            print("use early stop num:", early_stop_num)
-            stop = True
+def main(args):
+    config = load_yaml_config(args.config_file)
 
-        if torch.argmax(logits, dim=-1)[0] == self.EOS or samples[0, 0] == self.EOS:
-            # print(torch.argmax(logits, dim=-1)[0] == self.EOS, samples[0, 0] == self.EOS)
-            stop = True
-        if stop:
-            if prompts.shape[1] == y.shape[1]:
-                y = torch.concat([y, torch.zeros_like(samples)], dim=1)
-                print("bad zero prediction")
-            print(f"T2S Decoding EOS [{prefix_len} -> {y.shape[1]}]")
-            break
-        # 本次生成的 semantic_ids 和之前的 y 构成新的 y
-        # print(samples.shape)#[1,1]#第一个1是bs
-        # import os
-        # os._exit(2333)
-        y = torch.concat([y, samples], dim=1)
-    return y
+    output_dir = Path(config["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    ckpt_dir = output_dir / "ckpt"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    seed_everything(config["train"]["seed"], workers=True)
+    ckpt_callback: ModelCheckpoint = my_model_ckpt(
+        config=config,
+        if_save_latest=config["train"]["if_save_latest"],
+        if_save_every_weights=config["train"]["if_save_every_weights"],
+        half_weights_save_dir=config["train"]["half_weights_save_dir"],
+        exp_name=config["train"]["exp_name"],
+        save_top_k=-1,
+        monitor="top_3_acc",
+        mode="max",
+        save_on_train_epoch_end=True,
+        every_n_epochs=config["train"]["save_every_n_epoch"],
+        dirpath=ckpt_dir,
+    )
+    logger = TensorBoardLogger(name=output_dir.stem, save_dir=output_dir)
+    os.environ["MASTER_ADDR"]="localhost"
+    trainer: Trainer = Trainer(
+        max_epochs=config["train"]["epochs"],
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        # val_check_interval=9999999999999999999999,###不要验证
+        # check_val_every_n_epoch=None,
+        limit_val_batches=0,
+        devices=-1 if torch.cuda.is_available() else 1,
+        benchmark=False,
+        fast_dev_run=False,
+        strategy = DDPStrategy(
+            process_group_backend="nccl" if platform.system() != "Windows" else "gloo"
+        ) if torch.cuda.is_available() else "auto",
+        precision=config["train"]["precision"],
+        logger=logger,
+        num_sanity_val_steps=0,
+        callbacks=[ckpt_callback],
+    )
+
+    model: Text2SemanticLightningModule = Text2SemanticLightningModule(
+        config, output_dir
+    )
+
+    data_module: Text2SemanticDataModule = Text2SemanticDataModule(
+        config,
+        train_semantic_path=config["train_semantic_path"],
+        train_phoneme_path=config["train_phoneme_path"],
+        # dev_semantic_path=args.dev_semantic_path,
+        # dev_phoneme_path=args.dev_phoneme_path
+    )
+
+    try:
+        # 使用正则表达式匹配文件名中的数字部分，并按数字大小进行排序
+        newest_ckpt_name = get_newest_ckpt(os.listdir(ckpt_dir))
+        ckpt_path = ckpt_dir / newest_ckpt_name
+    except Exception:
+        ckpt_path = None
+    print("ckpt_path:", ckpt_path)
+    trainer.fit(model, data_module, ckpt_path=ckpt_path)
+
+
+# srun --gpus-per-node=1 --ntasks-per-node=1 python train.py --path-to-configuration configurations/default.yaml
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-c",
+        "--config_file",
+        type=str,
+        default="configs/s1longer.yaml",
+        help="path of config file",
+    )
+    args = parser.parse_args()
+    logging.info(str(args))
+    main(args)
